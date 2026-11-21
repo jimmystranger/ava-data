@@ -1,0 +1,133 @@
+# The STANDBY producer of the storm files (launch review 2026-11-21 LR-54, owner Q18: "yes, a job in the public ava-data
+# repository"; the builders stay private, read with a read-only key: owner, same day).
+#
+# The main producer is a job on the Oracle VM, every 6 hours. If that VM is down or its job keeps failing, the app's cyclone
+# tracks, active-storm list and ENSO status go stale and the server only raises an alarm. This job looks every 2 hours: while
+# the files here are under 8 hours old it stops at once (a few seconds). When they are older it builds them itself, with the
+# same builder scripts, and publishes only a file that is NEWER than the one here. Public-repository minutes are free.
+#
+# The builder scripts live in the private repository; the secret AVA_PRIVATE_READ_KEY is a READ-ONLY deploy key for it
+# (it cannot write there). Nothing from that repository is printed, uploaded or kept: only the three data files are copied.
+name: "Standby: storm data when the main producer is late"
+
+on:
+  schedule:
+    - cron: "25 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if the files here are fresh"
+        type: boolean
+        default: false
+      dry:
+        description: "Build and check, publish nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: standby
+  cancel-in-progress: false
+
+jobs:
+  standby:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: How old are the storm files?
+        id: age
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          node -e '
+            const fs = require("fs"), LIMIT_H = 8;
+            let worst = 0;
+            for (const f of ["tc_tracks.json", "nhc.json", "enso.json"]) {
+              let h = Infinity;
+              try { h = (Date.now() - Date.parse(JSON.parse(fs.readFileSync("data/" + f, "utf8")).generated)) / 3600000; } catch (e) {}
+              if (!(h >= 0)) h = Infinity;
+              console.log(f + ": " + (Number.isFinite(h) ? h.toFixed(1) + " h old" : "unreadable"));
+              worst = Math.max(worst, h);
+            }
+            const late = worst > LIMIT_H || process.env.FORCE === "true";
+            console.log(late ? "LATE (or forced): the standby builds" : "fresh: nothing to do");
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, "late=" + late + "\n");
+          '
+
+      - name: The builder scripts (private repository, read-only key)
+        if: steps.age.outputs.late == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: jimmystranger/leo-nui-planner
+          ssh-key: ${{ secrets.AVA_PRIVATE_READ_KEY }}
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        if: steps.age.outputs.late == 'true'
+        with:
+          node-version: "22"
+
+      - uses: actions/setup-python@v5
+        if: steps.age.outputs.late == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: eccodes (the BUFR reader) and the ECMWF open-data client
+        if: steps.age.outputs.late == 'true'
+        run: python -m pip install --quiet eccodes ecmwf-opendata
+
+      - name: ECMWF tropical-cyclone tracks
+        if: steps.age.outputs.late == 'true'
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -o pipefail
+          mkdir -p pipeline/cache/cyclones
+          python pipeline/cyclones/decode_tc.py --fetch --out pipeline/cache/cyclones > pipeline/cache/cyclones/tracks_raw.json
+          node pipeline/cyclones/build_tc.mjs
+
+      - name: NHC / CPHC active storms
+        if: steps.age.outputs.late == 'true'
+        continue-on-error: true
+        working-directory: src
+        run: node pipeline/cyclones/build_nhc.mjs
+
+      - name: CPC ENSO status
+        if: steps.age.outputs.late == 'true'
+        continue-on-error: true
+        working-directory: src
+        run: node pipeline/enso/build_enso.mjs
+
+      - name: Shape checks over the files just written (a failure publishes nothing)
+        if: steps.age.outputs.late == 'true'
+        working-directory: src
+        run: node tests/batch_data.mjs --built
+
+      - name: Publish only what is newer than the copy here
+        if: steps.age.outputs.late == 'true'
+        env:
+          DRY: ${{ github.event.inputs.dry }}
+        run: |
+          changed=0
+          for f in tc_tracks.json nhc.json enso.json; do
+            [ -f "src/web/data/$f" ] || continue
+            newer=$(node -e '
+              const gen = (p) => { try { return Date.parse(JSON.parse(require("fs").readFileSync(p, "utf8")).generated) || 0; } catch (e) { return 0; } };
+              const [built, here] = process.argv.slice(1).map(gen);
+              console.log(built > here ? "yes" : "no");
+            ' "src/web/data/$f" "data/$f")
+            if [ "$newer" = yes ]; then cp "src/web/data/$f" "data/$f"; changed=1; echo "$f: newer, taken"; else echo "$f: not newer than the copy here, left"; fi
+          done
+          rm -rf src
+          if [ "$DRY" = "true" ]; then echo "dry run: nothing published"; git checkout -- data; exit 0; fi
+          if [ "$changed" = 0 ] || git diff --quiet -- data; then echo "no change"; exit 0; fi
+          git config user.name "data-bot"; git config user.email "data-bot@users.noreply.github.com"
+          git add data
+          git commit --quiet -m "data: $(date -u +%Y-%m-%dT%H:%MZ) (standby)"
+          git push --quiet origin HEAD:main && echo "published by the standby: $(git rev-parse --short HEAD)"
