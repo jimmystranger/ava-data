@@ -1,0 +1,65 @@
+# ONE-OFF timing test (owner 22 Nov: "yes, test one slot on GitHub Actions"; docs/launch/ops/full-backup-plan.md): can a free
+# GitHub-hosted runner build one tile region the way the Oracle VM does? It builds into the runner's temp folder only:
+# no PROXY_BASE and no ingest token exist here, so nothing is uploaded and nothing reaches the app. Run by hand only.
+# The builder scripts stay private (read-only deploy key, as standby.yml); the build's own output goes to a file and only
+# timing lines are printed, so no private code appears in this public log. To be removed after the test.
+name: "Test: time one tile region (no upload)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "Region id"
+        default: "fp"
+      profiles:
+        description: "Profiles (all = every profile)"
+        default: "all"
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: The builder scripts (private repository, read-only key)
+        uses: actions/checkout@v4
+        with:
+          repository: jimmystranger/leo-nui-planner
+          ssh-key: ${{ secrets.AVA_PRIVATE_READ_KEY }}
+          path: src
+          fetch-depth: 1
+          sparse-checkout: pipeline/forecast
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dependencies (as the builder image)
+        run: python -m pip install --quiet numpy eccodes omfiles s3fs tzdata && nproc && free -g | head -2
+
+      - name: Build one region, timed (output kept private, timings printed)
+        env:
+          REGION: ${{ github.event.inputs.region }}
+          PROFILES: ${{ github.event.inputs.profiles }}
+          OM_S3_ENDPOINT: https://s3.us-west-2.amazonaws.com
+          TILE_WRITE: both
+          FILL_SIDE: "1"
+          AUTO_COAST: "0"
+          ALWAYS_COAST: list
+          INGEST_WORKERS: "4"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          case "$REGION$PROFILES" in *[!a-z0-9_,]*) echo "bad input"; exit 2;; esac
+          T="$RUNNER_TEMP"; set +e
+          /usr/bin/time -v -o "$T/time.txt" python src/pipeline/forecast/container_job.py --mode backup --regions "$REGION" \
+            --profiles "$PROFILES" --store "$T/store" --out "$T/out" > "$T/build.log" 2>&1
+          rc=$?; set -e
+          echo "rc $rc"
+          grep -E '^[a-z_]+: [0-9]+ tiles|^[a-z_]+ built in [0-9]+s' "$T/build.log" | sed -E 's/ \(([0-9]+) range reads, ([0-9]+)s in reads\).*/ (\1 range reads, \2 s in reads)/' || true
+          grep -E 'Elapsed \(wall clock\)|Maximum resident set size|Percent of CPU' "$T/time.txt" || true
+          du -sh "$T/out" "$T/store" 2>/dev/null | sed "s#$T#TEMP#" || true
+          [ "$rc" = 0 ] || tail -n 40 "$T/build.log" | grep -E '^[A-Za-z]+(Error|Exception|Exit)' | tail -1 | cut -c1-160
+          rm -rf src "$T/out" "$T/store" "$T/build.log"
